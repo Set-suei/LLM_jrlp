@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import shutil
 import threading
 import time
@@ -488,6 +489,53 @@ class JrlpPlugin(Star):
         return ""
 
     # ─── GENIE 语音接入 ───────────────────────────────────────────────
+    def _is_genie_active(self, event: AstrMessageEvent) -> bool:
+        """检查当前会话与环境下是否启用了语音插件。"""
+        genie = self._find_genie()
+        if genie is None:
+            return False
+        try:
+            sid = str(getattr(event, "unified_msg_origin", None) or "default")
+            if hasattr(genie, "data_manager") and hasattr(genie.data_manager, "is_tts_disabled"):
+                if genie.data_manager.is_tts_disabled(sid):
+                    return False
+            if hasattr(genie, "_should_auto_tts"):
+                if not genie._should_auto_tts(event, sid):
+                    return False
+            if hasattr(genie, "prompt_injection_enabled") and not genie.prompt_injection_enabled:
+                return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clean_single_chinese(text: str) -> str:
+        """在未启用语音插件时，清洗提取单语言（纯中文），剥离日文与标签。"""
+        if not text:
+            return ""
+        # 优先提取 <zh>...</zh>
+        zh_matches = re.findall(r"<zh>(.*?)</zh>", text, re.DOTALL | re.IGNORECASE)
+        if zh_matches:
+            return "\n".join(m.strip() for m in zh_matches if m.strip())
+        # 移除 <ja>...</ja> 及其内容
+        cleaned = re.sub(r"<ja>[\s\S]*?</ja>", "", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<thought>[\s\S]*?</thought>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?[A-Za-z_][^<>]*>", "", cleaned).strip()
+        # 逐行过滤掉纯假名日文行
+        lines = []
+        kana_re = re.compile(r"[぀-ゟ゠-ヿ]")
+        cjk_re = re.compile(r"[一-鿿]")
+        for line in cleaned.splitlines():
+            line_s = line.strip()
+            if not line_s:
+                continue
+            if kana_re.search(line_s) and not cjk_re.search(line_s):
+                continue
+            lines.append(line_s)
+        res = "\n".join(lines).strip()
+        return res or cleaned
+
     def _find_genie(self):
         """查找已加载且激活的 genie 语音插件实例。
 
@@ -516,29 +564,32 @@ class JrlpPlugin(Star):
     # ─── LLM 评价 ──────────────────────────────────────────────────────
     async def _llm(self, event: AstrMessageEvent, prompt: str, fallback: str) -> str:
         """调用 LLM 生成回复。
-
-        若 genie 语音插件已加载且启用了双语注入：在其请求中附上与普通聊天一致
-        的双语输出要求（<zh>/<ja>），随后把整段回复交给 genie.voice_plugin_reply
-        处理——按当前会话设置返回应展示的文本，并把其中的日文送入语音合成队列，
-        与普通 LLM 聊天“文字 + 语音”的体验保持一致。
-
-        genie 未安装 / 未启用 / 调用失败时，退回原有的纯文本行为，不影响插件使用。
+        开语音插件时：注入双语要求并通过 voice_plugin_reply 协同发送日文语音；
+        没开语音插件时：使用普通中文 Prompt，并严格输出单语言中文，不输出日文标签与语音。
         """
         try:
             provider = self.context.get_using_provider(event.unified_msg_origin)
             if provider is not None:
                 persona_prompt = await self._get_persona_prompt(event)
-                genie = self._find_genie()
-                if genie is not None:
+                is_voice_active = self._is_genie_active(event)
+                genie = self._find_genie() if is_voice_active else None
+
+                llm_prompt = prompt
+                if is_voice_active and genie is not None:
                     try:
                         hint = genie.build_prompt_injection_hint() or ""
                         if hint:
                             persona_prompt = f"{persona_prompt or ''}{hint}"
+                        llm_prompt = (
+                            f"{prompt}\n"
+                            "【特别输出规范】：请务必同时严格输出 <zh>中文回复</zh> 与 <ja>日本語の返信</ja> 两种语言标签，"
+                            "<ja> 标签内必须为地道日语对白（严禁英文、中文或动作括号）。"
+                        )
                     except Exception as e:
                         logger.warning(f"[LLM-jrlp] 读取 genie 双语注入提示失败: {e}")
 
                 resp = await provider.text_chat(
-                    prompt=prompt,
+                    prompt=llm_prompt,
                     session_id=None,
                     contexts=[],
                     image_urls=[],
@@ -546,22 +597,34 @@ class JrlpPlugin(Star):
                 )
                 text = (resp.completion_text or "").strip()
                 if text:
-                    if genie is not None:
+                    if is_voice_active and genie is not None:
                         try:
-                            voice_plugin_reply = getattr(
-                                genie, "voice_plugin_reply", None
-                            )
+                            voice_plugin_reply = getattr(genie, "voice_plugin_reply", None)
                             if voice_plugin_reply:
                                 display = await voice_plugin_reply(event, text)
                                 if display:
                                     return display
                         except Exception as e:
-                            logger.warning(
-                                f"[LLM-jrlp] genie 语音接入失败，按原文展示: {e}"
-                            )
-                    return text
+                            logger.warning(f"[LLM-jrlp] genie 语音接入失败，按单语言展示: {e}")
+                    # 没开语音插件时，严格过滤日文与标签，输出单语言中文
+                    return self._clean_single_chinese(text)
         except Exception as e:
             logger.error(f"[LLM-jrlp] LLM 调用失败: {e}")
+
+        if fallback:
+            if self._is_genie_active(event):
+                genie = self._find_genie()
+                if genie is not None:
+                    try:
+                        voice_plugin_reply = getattr(genie, "voice_plugin_reply", None)
+                        if callable(voice_plugin_reply):
+                            disp = await voice_plugin_reply(event, fallback)
+                            if disp:
+                                return disp
+                    except Exception as e:
+                        logger.warning(f"[LLM-jrlp] fallback 语音接入失败: {e}")
+            return self._clean_single_chinese(fallback)
+
         return fallback
 
     @staticmethod
