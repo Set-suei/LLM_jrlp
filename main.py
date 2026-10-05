@@ -100,9 +100,7 @@ class JrlpPlugin(Star):
         self._dl_progress = ""
         self._load()
 
-        # 图库为空时后台自动触发下载（不阻塞插件启动）
-        if len(self._list_images()) == 0:
-            self._start_download_bg()
+        # 注意：不在 __init__ 自动拉起外网大文件下载线程，确保在沙箱加载、测试及市场解析时零开销纯净启动
 
     def _cfg(self, key: str, default):
         return self.config.get(key, default)
