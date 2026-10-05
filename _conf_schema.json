@@ -1,0 +1,12 @@
+{
+  "daily_hlp_limit": {
+    "description": "每天最多换老婆次数",
+    "type": "int",
+    "default": 5
+  },
+  "marriage_duration": {
+    "description": "结婚维持时间(天)",
+    "type": "int",
+    "default": 7
+  }
+}

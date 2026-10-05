@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+jrlp_data.json
+.venv/
+*.log
+*.zip
+img/
