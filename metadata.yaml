@@ -1,6 +1,6 @@
 name: astrbot_plugin_LLM_jrlp
 display_name: galgame-LLM-jrlp
 desc: 今日老婆插件移植版：随机抽一位 gal 角色作为今日老婆，支持换老婆/结婚/离婚，回复完全由 LLM 生成
-version: 1.1.0
+version: 1.1.1
 author: Set-suei
 repo: https://github.com/Set-suei/galgame-LLM-jrlp

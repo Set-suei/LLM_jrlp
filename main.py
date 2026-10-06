@@ -15,9 +15,29 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 
+PLUGIN_NAME = "astrbot_plugin_LLM_jrlp"
 PLUGIN_DIR = Path(__file__).resolve().parent
-IMG_DIR = PLUGIN_DIR / "img"
-DATA_FILE = PLUGIN_DIR / "jrlp_data.json"
+
+
+# AstrBot 官方规范插件持久化数据目录：data/plugin_data/astrbot_plugin_LLM_jrlp/
+def _resolve_data_dir() -> Path:
+    try:
+        from astrbot.api.star import StarTools
+        d = StarTools.get_data_dir(PLUGIN_NAME)
+        if d:
+            target_p = Path(d)
+            target_p.mkdir(parents=True, exist_ok=True)
+            return target_p
+    except Exception:
+        pass
+    fallback = Path("data") / "plugin_data" / PLUGIN_NAME
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+DATA_DIR = _resolve_data_dir()
+IMG_DIR = DATA_DIR / "img"
+DATA_FILE = DATA_DIR / "jrlp_data.json"
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 MS_PER_DAY = 86400
 
@@ -88,7 +108,7 @@ PROMPT_EMPTY = (
     "astrbot_plugin_LLM_jrlp",
     "galgame-LLM-jrlp",
     "今日老婆插件移植版：随机抽一位 gal 角色作为今日老婆，支持换老婆、结婚、离婚，回复完全由 LLM 生成",
-    "1.1.0",
+    "1.1.1",
 )
 class JrlpPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -99,6 +119,7 @@ class JrlpPlugin(Star):
         self._dl_running = False
         self._dl_status = "idle"
         self._dl_progress = ""
+        self._migrate_legacy_data()
         self._load()
 
         # 注意：不在 __init__ 自动拉起外网大文件下载线程，确保在沙箱加载、测试及市场解析时零开销纯净启动
@@ -133,7 +154,7 @@ class JrlpPlugin(Star):
         return True
 
     def _download_worker(self, force: bool = False):
-        zip_tmp = PLUGIN_DIR / "jrlp_img_download.tmp"
+        zip_tmp = DATA_DIR / "jrlp_img_download.tmp"
         try:
             logger.info("[LLM-jrlp] 开始下载 Release 角色图库资源包 (约263MB)...")
             downloaded = False
@@ -255,6 +276,31 @@ class JrlpPlugin(Star):
         else:
             yield event.plain_result("后台已有下载任务正在运行中，请稍候查看。")
 
+    def _migrate_legacy_data(self):
+        """兼容旧版本：将旧插件安装目录下的用户数据和立绘平滑迁移至标准数据目录"""
+        try:
+            legacy_data = PLUGIN_DIR / "jrlp_data.json"
+            if not DATA_FILE.is_file() and legacy_data.is_file():
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy_data, DATA_FILE)
+                logger.info(f"[{PLUGIN_NAME}] 已将旧数据迁移至标准目录: {DATA_FILE}")
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 迁移旧数据失败: {e}")
+
+        try:
+            legacy_img = PLUGIN_DIR / "img"
+            if legacy_img.is_dir() and any(legacy_img.iterdir()):
+                IMG_DIR.mkdir(parents=True, exist_ok=True)
+                if not any(IMG_DIR.iterdir()):
+                    for src in legacy_img.iterdir():
+                        if src.is_file():
+                            dst = IMG_DIR / src.name
+                            if not dst.exists():
+                                shutil.copy2(src, dst)
+                    logger.info(f"[{PLUGIN_NAME}] 已将旧立绘图库迁移至标准目录: {IMG_DIR}")
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 迁移旧立绘图库失败: {e}")
+
     # ─── 持久化 ────────────────────────────────────────────────────────
     def _load(self):
         try:
@@ -320,13 +366,22 @@ class JrlpPlugin(Star):
 
     # ─── 角色图库 ──────────────────────────────────────────────────────
     def _list_images(self) -> list[Path]:
-        if not IMG_DIR.is_dir():
-            return []
-        return [
-            p
-            for p in IMG_DIR.rglob("*")
-            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
-        ]
+        images = []
+        if IMG_DIR.is_dir():
+            images.extend(
+                p
+                for p in IMG_DIR.rglob("*")
+                if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+            )
+        if not images:
+            legacy_img = PLUGIN_DIR / "img"
+            if legacy_img.is_dir():
+                images.extend(
+                    p
+                    for p in legacy_img.rglob("*")
+                    if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+                )
+        return images
 
     def _random_character(self) -> dict | None:
         images = self._list_images()
@@ -705,10 +760,10 @@ class JrlpPlugin(Star):
         elif low in ("jrlp status", "今日老婆 status", "jrlp状态", "今日老婆状态"):
             async for r in self._status(event):
                 yield r
-        elif low in ("jrlp 结婚", "今日老婆 结婚", "结婚"):
+        elif low in ("jrlp 结婚", "今日老婆 结婚", "和今日老婆结婚", "与今日老婆结婚"):
             async for r in self._marry(event):
                 yield r
-        elif low in ("jrlp 离婚", "今日老婆 离婚", "离婚"):
+        elif low in ("jrlp 离婚", "今日老婆 离婚", "和今日老婆离婚", "与今日老婆离婚"):
             async for r in self._divorce(event):
                 yield r
         elif low in ("jrlp download", "今日老婆 download", "下载图库", "jrlp下载图库"):
