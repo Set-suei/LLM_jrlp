@@ -8,5 +8,15 @@
     "description": "结婚维持时间(天)",
     "type": "int",
     "default": 7
+  },
+  "auto_download_images": {
+    "description": "图库为空时是否自动拉取 Release 资源包（约263MB；关闭时需管理员/用户显式发送「jrlp 下载图库」确认下载）",
+    "type": "bool",
+    "default": false
+  },
+  "use_mirror_accelerate": {
+    "description": "下载图库时优先使用国内加速镜像（若关闭则直连 GitHub 官方 Release 源）",
+    "type": "bool",
+    "default": false
   }
 }

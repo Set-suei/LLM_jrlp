@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import random
 import re
+import asyncio
 import shutil
-import threading
 import time
-import urllib.request
 import zipfile
+import aiohttp
 from pathlib import Path
 
 from astrbot.api import logger
@@ -41,10 +41,12 @@ DATA_FILE = DATA_DIR / "jrlp_data.json"
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 MS_PER_DAY = 86400
 
-RELEASE_IMG_URLS = [
-    "https://ghfast.top/https://github.com/Set-suei/galgame-LLM-jrlp/releases/download/v1.1.0/jrlp_img.zip",
-    "https://github.com/Set-suei/galgame-LLM-jrlp/releases/download/v1.1.0/jrlp_img.zip",
-]
+GITHUB_RELEASE_URL = (
+    "https://github.com/Set-suei/galgame-LLM-jrlp/releases/download/v1.1.0/jrlp_img.zip"
+)
+MIRROR_RELEASE_URL = (
+    "https://ghfast.top/https://github.com/Set-suei/galgame-LLM-jrlp/releases/download/v1.1.0/jrlp_img.zip"
+)
 
 PROMPT_JRLP = (
     "用户「{player}」抽今日老婆，抽到了「{wife_name}」。"
@@ -108,14 +110,13 @@ PROMPT_EMPTY = (
     "astrbot_plugin_LLM_jrlp",
     "galgame-LLM-jrlp",
     "今日老婆插件移植版：随机抽一位 gal 角色作为今日老婆，支持换老婆、结婚、离婚，回复完全由 LLM 生成",
-    "1.1.1",
+    "1.1.3",
 )
 class JrlpPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
         self._data = {"version": 2, "users": {}}
-        self._dl_lock = threading.Lock()
         self._dl_running = False
         self._dl_status = "idle"
         self._dl_progress = ""
@@ -135,100 +136,113 @@ class JrlpPlugin(Star):
     def marriage_duration(self) -> int:
         return int(self._cfg("marriage_duration", 7))
 
-    # ─── 图库后台自动下载与解压 ──────────────────────────────────────────
-    def _start_download_bg(self, force: bool = False) -> bool:
-        with self._dl_lock:
-            if self._dl_running:
-                return False
-            self._dl_running = True
-            self._dl_status = "preparing"
-            self._dl_progress = "准备中..."
+    @property
+    def auto_download_images(self) -> bool:
+        return bool(self._cfg("auto_download_images", False))
 
-        t = threading.Thread(
-            target=self._download_worker,
-            args=(force,),
-            daemon=True,
-            name="LLM-jrlp-img-downloader",
-        )
-        t.start()
+    @property
+    def use_mirror_accelerate(self) -> bool:
+        return bool(self._cfg("use_mirror_accelerate", False))
+
+    # ─── 图库后台异步流式下载与解压（aiohttp + asyncio）──────────────────
+    def _get_download_urls(self) -> list[str]:
+        if self.use_mirror_accelerate:
+            return [MIRROR_RELEASE_URL, GITHUB_RELEASE_URL]
+        return [GITHUB_RELEASE_URL, MIRROR_RELEASE_URL]
+
+    def _start_download_bg(self, force: bool = False) -> bool:
+        if self._dl_running:
+            return False
+        self._dl_running = True
+        self._dl_status = "preparing"
+        self._dl_progress = "准备中..."
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._download_worker_async(force=force))
+        except RuntimeError:
+            asyncio.create_task(self._download_worker_async(force=force))
         return True
 
-    def _download_worker(self, force: bool = False):
-        zip_tmp = DATA_DIR / "jrlp_img_download.tmp"
-        try:
-            logger.info("[LLM-jrlp] 开始下载 Release 角色图库资源包 (约263MB)...")
-            downloaded = False
-            for url in RELEASE_IMG_URLS:
-                host = url.split("/")[2]
-                self._dl_status = f"downloading ({host})"
-                self._dl_progress = "连接中..."
-                try:
-                    req = urllib.request.Request(
-                        url,
-                        headers={"User-Agent": "AstrBot-LLM-jrlp/1.1.0"},
-                    )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        total = int(resp.headers.get("Content-Length", 0))
-                        chunk_size = 512 * 1024
-                        received = 0
-                        with open(zip_tmp, "wb") as out:
-                            while True:
-                                chunk = resp.read(chunk_size)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                                received += len(chunk)
-                                if total > 0:
-                                    pct = int(received * 100 / total)
-                                    mb_cur = received / (1024 * 1024)
-                                    mb_tot = total / (1024 * 1024)
-                                    self._dl_progress = f"{mb_cur:.1f}MB/{mb_tot:.1f}MB ({pct}%)"
-                                else:
-                                    mb_cur = received / (1024 * 1024)
-                                    self._dl_progress = f"{mb_cur:.1f}MB"
-                    downloaded = True
-                    break
-                except Exception as e:
-                    logger.warning(f"[LLM-jrlp] 镜像源 {host} 下载失败: {e}")
-                    if zip_tmp.exists():
+    @staticmethod
+    def _extract_zip_file(zip_path: Path) -> int:
+        IMG_DIR.mkdir(parents=True, exist_ok=True)
+        extracted = 0
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                raw_name = Path(member.filename).name
+                if not raw_name:
+                    continue
+                if not (member.flag_bits & 0x800):
+                    for enc in ("gbk", "utf-8", "shift_jis"):
                         try:
-                            zip_tmp.unlink()
+                            raw_name = Path(member.filename.encode("cp437").decode(enc)).name
+                            break
                         except Exception:
                             pass
+                suffix = Path(raw_name).suffix.lower()
+                if suffix not in VALID_EXTENSIONS:
                     continue
+                target = IMG_DIR / raw_name
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+        return extracted
+
+    async def _download_worker_async(self, force: bool = False):
+        zip_tmp = DATA_DIR / "jrlp_img_download.tmp"
+        try:
+            logger.info("[LLM-jrlp] 开始异步流式下载 Release 角色图库资源包 (约263MB)...")
+            downloaded = False
+            urls = self._get_download_urls()
+            timeout = aiohttp.ClientTimeout(total=900, connect=20)
+            headers = {"User-Agent": "AstrBot-LLM-jrlp/1.1.3"}
+
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                for url in urls:
+                    host = url.split("/")[2]
+                    self._dl_status = f"downloading ({host})"
+                    self._dl_progress = "连接中..."
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status != 200:
+                                logger.warning(f"[LLM-jrlp] 下载源 {host} 返回状态码 {resp.status}")
+                                continue
+                            total = int(resp.headers.get("Content-Length", 0))
+                            received = 0
+                            with open(zip_tmp, "wb") as out:
+                                async for chunk in resp.content.iter_chunked(65536):
+                                    out.write(chunk)
+                                    received += len(chunk)
+                                    if total > 0:
+                                        pct = int(received * 100 / total)
+                                        mb_cur = received / (1024 * 1024)
+                                        mb_tot = total / (1024 * 1024)
+                                        self._dl_progress = f"{mb_cur:.1f}MB/{mb_tot:.1f}MB ({pct}%)"
+                                    else:
+                                        mb_cur = received / (1024 * 1024)
+                                        self._dl_progress = f"{mb_cur:.1f}MB"
+                            downloaded = True
+                            break
+                    except Exception as e:
+                        logger.warning(f"[LLM-jrlp] 镜像源 {host} 异步拉取失败: {e}")
+                        if zip_tmp.exists():
+                            try:
+                                zip_tmp.unlink()
+                            except Exception:
+                                pass
+                        continue
 
             if not downloaded or not zip_tmp.exists():
                 self._dl_status = "failed"
-                self._dl_progress = "下载失败，请检查网络后重试"
+                self._dl_progress = "下载失败，请检查网络或发送「jrlp force-download」重试"
                 logger.error("[LLM-jrlp] 角色图库下载失败：所有下载源均不可达")
                 return
 
             self._dl_status = "extracting"
             self._dl_progress = "正在解压立绘..."
-            IMG_DIR.mkdir(parents=True, exist_ok=True)
-            extracted = 0
-
-            with zipfile.ZipFile(zip_tmp, "r") as zf:
-                for member in zf.infolist():
-                    if member.is_dir():
-                        continue
-                    raw_name = Path(member.filename).name
-                    if not raw_name:
-                        continue
-                    if not (member.flag_bits & 0x800):
-                        for enc in ("gbk", "utf-8", "shift_jis"):
-                            try:
-                                raw_name = Path(member.filename.encode("cp437").decode(enc)).name
-                                break
-                            except Exception:
-                                pass
-                    suffix = Path(raw_name).suffix.lower()
-                    if suffix not in VALID_EXTENSIONS:
-                        continue
-                    target = IMG_DIR / raw_name
-                    with zf.open(member) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    extracted += 1
+            extracted = await asyncio.to_thread(self._extract_zip_file, zip_tmp)
 
             self._dl_status = "completed"
             self._dl_progress = f"完成，共解压 {extracted} 张角色立绘"
@@ -243,8 +257,7 @@ class JrlpPlugin(Star):
                     zip_tmp.unlink()
                 except Exception:
                     pass
-            with self._dl_lock:
-                self._dl_running = False
+            self._dl_running = False
 
     async def _download_command(self, event: AstrMessageEvent, force: bool = False):
         total = len(self._list_images())
@@ -269,9 +282,9 @@ class JrlpPlugin(Star):
         if started:
             yield event.plain_result(
                 "【开始下载图库】\n"
-                "已启动后台下载任务（资源包约 263MB）。\n"
-                "支持国内镜像加速，下载与解压完成后将自动载入，无需重启。\n"
-                "可随时发送「jrlp download」查看实时进度。"
+                "已启动后台异步流式下载任务（资源包约 263MB）。\n"
+                "优先通过 GitHub 官方 Release 资源节点拉取（支持备选镜像加速），下载解压后自动生效，无需重启。\n"
+                "可随时发送「jrlp download」或「jrlp 状态」查看实时进度。"
             )
         else:
             yield event.plain_result("后台已有下载任务正在运行中，请稍候查看。")
@@ -854,17 +867,24 @@ class JrlpPlugin(Star):
             if self._dl_running:
                 yield event.plain_result(
                     f"【角色图库准备中】\n"
-                    f"检测到本地图库正在下载/解压中（{self._dl_progress}）。\n"
-                    f"请稍等片刻，下载完成后即可抽取今日老婆~"
+                    f"检测到本地图库正在后台异步流式下载/解压中（{self._dl_progress}）。\n"
+                    f"请稍等片刻，下载解压完成后即可直接抽取今日老婆~"
                 )
-            else:
+            elif self.auto_download_images:
                 self._start_download_bg()
                 text = await self._llm(
                     event,
                     PROMPT_EMPTY.format(player=name),
-                    "获取老婆失败，本地角色图库为空。已自动开启后台下载任务（约263MB），稍候即可抽取。",
+                    "获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。",
                 )
                 yield event.plain_result(text)
+            else:
+                yield event.plain_result(
+                    f"【角色图库为空】\n"
+                    f"本地尚未安装角色立绘图库。\n"
+                    f"请发送「jrlp 下载图库」或「jrlp download」确认开始后台异步下载立绘资源包（约 263MB，包含 320 位 gal 角色）；\n"
+                    f"或手动将立绘解压放入 data/plugin_data/astrbot_plugin_LLM_jrlp/img 目录。"
+                )
             return
 
         user["wife"] = {"name": chara["name"]}
@@ -922,17 +942,24 @@ class JrlpPlugin(Star):
             if self._dl_running:
                 yield event.plain_result(
                     f"【角色图库准备中】\n"
-                    f"检测到本地图库正在下载/解压中（{self._dl_progress}）。\n"
-                    f"请稍等片刻，下载完成后即可抽取今日老婆~"
+                    f"检测到本地图库正在后台异步流式下载/解压中（{self._dl_progress}）。\n"
+                    f"请稍等片刻，下载解压完成后即可直接抽取今日老婆~"
                 )
-            else:
+            elif self.auto_download_images:
                 self._start_download_bg()
                 text = await self._llm(
                     event,
                     PROMPT_EMPTY.format(player=name),
-                    "获取老婆失败，本地角色图库为空。已自动开启后台下载任务（约263MB），稍候即可抽取。",
+                    "获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。",
                 )
                 yield event.plain_result(text)
+            else:
+                yield event.plain_result(
+                    f"【角色图库为空】\n"
+                    f"本地尚未安装角色立绘图库。\n"
+                    f"请发送「jrlp 下载图库」或「jrlp download」确认开始后台异步下载立绘资源包（约 263MB，包含 320 位 gal 角色）；\n"
+                    f"或手动将立绘解压放入 data/plugin_data/astrbot_plugin_LLM_jrlp/img 目录。"
+                )
             return
 
         user["wife"] = {"name": chara["name"]}
@@ -1040,3 +1067,4 @@ class JrlpPlugin(Star):
             f"每日换老婆上限: {self.daily_limit}\n"
             f"婚姻维持天数: {self.marriage_duration}"
         )
+
