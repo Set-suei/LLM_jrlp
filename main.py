@@ -638,7 +638,7 @@ class JrlpPlugin(Star):
                         llm_prompt = (
                             f"{prompt}\n"
                             "【特别输出规范】：请务必同时严格输出 <zh>中文回复</zh> 与 <ja>日本語の返信</ja> 两种语言标签，"
-                            "<ja> 标签内必须为地道日语对白（严禁英文、中文或动作括号）。"
+                            "<ja> 标签内必须为地道日语对白（严禁英文、动作括号，中文人名/昵称必须转为日文假名读音，如若曦->アガサシ）。"
                         )
                     except Exception as e:
                         logger.warning(f"[LLM-jrlp] 读取 genie 双语注入提示失败: {e}")
