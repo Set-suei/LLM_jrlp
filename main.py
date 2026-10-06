@@ -707,12 +707,12 @@ class JrlpPlugin(Star):
 
     @filter.command("jrlp", alias={"今日老婆"})
     async def jrlp(self, event: AstrMessageEvent):
-        """今日老婆。子指令：status / 结婚 / 离婚"""
+        """今日老婆。子指令：status / 结婚 / 离婚 / download / help"""
         if self._claim_event(event):
             return
         arg = event.message_str.strip().split(maxsplit=1)
-        sub = arg[1].strip() if len(arg) > 1 else ""
-        if sub == "status":
+        sub = arg[1].strip().lower() if len(arg) > 1 else ""
+        if sub in ("status", "状态"):
             async for r in self._status(event):
                 yield r
             return
@@ -728,9 +728,22 @@ class JrlpPlugin(Star):
             async for r in self._download_command(event, force=False):
                 yield r
             return
-        if sub in ("force-download", "强制下载"):
+        if sub in ("force-download", "强制下载", "强制下载图库"):
             async for r in self._download_command(event, force=True):
                 yield r
+            return
+        if sub in ("help", "帮助", "-h", "--help"):
+            help_text = (
+                "【galgame-LLM-jrlp 今日老婆】指令说明：\n"
+                "• jrlp / 今日老婆 ：抽取今日老婆（每天限 1 位）\n"
+                "• hlp / 换老婆 ：更换今日老婆（每天最多 5 次）\n"
+                "• jrlp 结婚 ：与今日老婆喜结良缘（持续 7 天，期间不可换老婆）\n"
+                "• jrlp 离婚 ：解除当前婚姻关系\n"
+                "• jrlp 状态 ：查看图库及当前已婚人数\n"
+                "• jrlp 下载图库 ：后台检测并下载完整立绘图库\n"
+                "支持带唤醒前缀（如 ~jrlp）或群内直接发送指令。"
+            )
+            yield event.plain_result(help_text)
             return
         async for r in self._draw(event):
             yield r
@@ -746,29 +759,57 @@ class JrlpPlugin(Star):
     # ─── 无前缀触发 ────────────────────────────────────────────────────
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_plain_message(self, event: AstrMessageEvent):
-        # 标准指令若已处理（或将要处理）本消息，这里不再兜底，避免重复回复
-        if self._claim_event(event):
-            return
         text = event.message_str.strip()
         low = text.lower()
-        if low in ("jrlp", "今日老婆"):
+        if low in ("jrlp", "今日老婆", "/jrlp", "/今日老婆"):
+            if self._claim_event(event):
+                return
             async for r in self._draw(event):
                 yield r
-        elif low in ("hlp", "换老婆"):
+        elif low in ("hlp", "换老婆", "/hlp", "/换老婆"):
+            if self._claim_event(event):
+                return
             async for r in self._redraw(event):
                 yield r
-        elif low in ("jrlp status", "今日老婆 status", "jrlp状态", "今日老婆状态"):
+        elif low in ("jrlp status", "今日老婆 status", "jrlp状态", "今日老婆状态", "jrlp 状态", "今日老婆 状态"):
+            if self._claim_event(event):
+                return
             async for r in self._status(event):
                 yield r
-        elif low in ("jrlp 结婚", "今日老婆 结婚", "和今日老婆结婚", "与今日老婆结婚"):
+        elif low in ("jrlp 结婚", "今日老婆 结婚", "和今日老婆结婚", "与今日老婆结婚", "jrlp marry", "jrlp结婚"):
+            if self._claim_event(event):
+                return
             async for r in self._marry(event):
                 yield r
-        elif low in ("jrlp 离婚", "今日老婆 离婚", "和今日老婆离婚", "与今日老婆离婚"):
+        elif low in ("jrlp 离婚", "今日老婆 离婚", "和今日老婆离婚", "与今日老婆离婚", "jrlp divorce", "jrlp离婚"):
+            if self._claim_event(event):
+                return
             async for r in self._divorce(event):
                 yield r
-        elif low in ("jrlp download", "今日老婆 download", "下载图库", "jrlp下载图库"):
+        elif low in ("jrlp download", "今日老婆 download", "下载图库", "jrlp下载图库", "jrlp 下载图库"):
+            if self._claim_event(event):
+                return
             async for r in self._download_command(event, force=False):
                 yield r
+        elif low in ("jrlp force-download", "今日老婆 force-download", "强制下载图库", "jrlp强制下载", "jrlp 强制下载图库"):
+            if self._claim_event(event):
+                return
+            async for r in self._download_command(event, force=True):
+                yield r
+        elif low in ("jrlp help", "今日老婆 help", "jrlp帮助", "今日老婆帮助", "jrlp 帮助", "今日老婆 帮助"):
+            if self._claim_event(event):
+                return
+            help_text = (
+                "【galgame-LLM-jrlp 今日老婆】指令说明：\n"
+                "• jrlp / 今日老婆 ：抽取今日老婆（每天限 1 位）\n"
+                "• hlp / 换老婆 ：更换今日老婆（每天最多 5 次）\n"
+                "• jrlp 结婚 ：与今日老婆喜结良缘（持续 7 天，期间不可换老婆）\n"
+                "• jrlp 离婚 ：解除当前婚姻关系\n"
+                "• jrlp 状态 ：查看图库及当前已婚人数\n"
+                "• jrlp 下载图库 ：后台检测并下载完整立绘图库\n"
+                "支持带唤醒前缀（如 ~jrlp）或群内直接发送指令。"
+            )
+            yield event.plain_result(help_text)
 
     # ─── 核心逻辑 ──────────────────────────────────────────────────────
     async def _draw(self, event: AstrMessageEvent):
